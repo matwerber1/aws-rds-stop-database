@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Invokes a Lambda function once every 6 hours to stop an RDS instance specified
+  in the stack parameters. If the instance is not available to be stopped, no
+  changes are made.
+
+Parameters:
+  DatabaseInstanceId:
+    Type: String
+    Description: The database ID that you want to stop. Note this is the short name (e.g. 'my data-database'), not the full ARN.
+
+Resources:
+  rdsStopperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: rds_stop_function
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref DatabaseInstanceId
+      Policies:
+        - Statement:
+          - Sid: StopRdsPolicy
+            Effect: Allow
+            Action:
+            - rds:StopDBCluster
+            - rds:StopDBInstance
+            - rds:DescribeDBInstances
+            Resource: '*'
+      Events:
+        RunEverySixHours:
+          Type: Schedule
+          Properties:
+            Schedule: rate(6 hours)
