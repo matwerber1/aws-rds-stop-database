@@ -1,6 +1,6 @@
 # aws-rds-stop-database
 
-Simple Lambda function that runs on a schedule to keep an RDS database stopped.
+Simple Lambda function that runs on a schedule to keep an RDS database stopped. AWS allows you to stop a database, but only up to 7 days. If you want to keep it stopped, you need an automation like this. I'd argue that it'd be easier to backup and restore the database, but doing so would cause a DNS name change that you'd have to edit in your application. That's also something you could automate, but some legacy apps require it to be hard-coded, so this alternate approach was made.
 
 ## Design
 
