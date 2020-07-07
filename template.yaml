@@ -1,36 +1,161 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: >
-  Invokes a Lambda function once every 6 hours to stop an RDS instance specified
-  in the stack parameters. If the instance is not available to be stopped, no
-  changes are made.
+
+Description: '
+  Invokes a Lambda function once every 6 hours to stop an RDS instance
+  specified in the stack parameters. If the instance is not available to be stopped,
+  no changes are made.
+  '
 
 Parameters:
   DatabaseInstanceId:
     Type: String
-    Description: The database ID that you want to stop. Note this is the short name (e.g. 'my data-database'), not the full ARN.
+    Description: The database ID that you want to stop. Note this is the short name
+      (e.g. 'my data-database'), not the full ARN.
+
+  AuroraClusterId:
+    Type: String
+    Description: Enter the cluster ID, only if your database is an Aurora database.
+    Default: "N/A"
+
+Conditions:
+  IsAuroraDatabase: !Not [!Equals [!Ref AuroraClusterId, "N/A"]]
 
 Resources:
-  rdsStopperFunction:
-    Type: AWS::Serverless::Function
+
+  # This IAM role is assigned to the Lambda function and allows it to stop your database:
+  rdsStopperFunctionRole:
+    Type: AWS::IAM::Role
     Properties:
-      CodeUri: rds_stop_function
-      Handler: index.handler
-      Runtime: nodejs12.x
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: rdsStopperFunctionRolePolicy0
+          PolicyDocument:
+            Statement:
+            - Action:
+              - rds:DescribeDBInstances
+              Resource: "*"
+              Effect: Allow
+              Sid: DescribeRDSPolicy
+            - Action:
+              - rds:StopDBCluster
+              - rds:StopDBInstance
+              Resource: 
+                - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${DatabaseInstanceId}"
+                - !If [IsAuroraDatabase, !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraClusterId}", !Ref "AWS::NoValue" ]
+              Effect: Allow
+              Sid: StopRdsPolicy
+        
+      Tags:
+      - Value: SAM
+        Key: lambda:createdBy
+  
+  # This allows CloudWatch Events to trigger your Lambda on a schedule:
+  CloudwatchEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      FunctionName:
+        Ref: rdsStopperFunction
+      SourceArn:
+        Fn::GetAtt:
+        - CloudwatchEvent
+        - Arn
+
+  # This is the CloudWatch Event Rule that triggers the Lambda every 30 minutes:
+  CloudwatchEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(30 minutes)
+      Targets:
+      - Id: CloudwatchEventTarget
+        Arn:
+          Fn::GetAtt:
+          - rdsStopperFunction
+          - Arn
+
+  # This is the Lambda that stops your database:
+  rdsStopperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
       Environment:
         Variables:
-          INSTANCE_ID: !Ref DatabaseInstanceId
-      Policies:
-        - Statement:
-          - Sid: StopRdsPolicy
-            Effect: Allow
-            Action:
-            - rds:StopDBCluster
-            - rds:StopDBInstance
-            - rds:DescribeDBInstances
-            Resource: '*'
-      Events:
-        RunEverySixHours:
-          Type: Schedule
-          Properties:
-            Schedule: rate(6 hours)
+          INSTANCE_ID:
+            Ref: DatabaseInstanceId
+      Handler: index.handler
+      Role:
+        Fn::GetAtt:
+        - rdsStopperFunctionRole
+        - Arn
+      Runtime: nodejs12.x
+      Code:
+        ZipFile: | 
+          var AWS = require('aws-sdk');
+          var rds = new AWS.RDS();
+          
+          exports.handler = async (event) => {      
+              console.log('Received event: ', JSON.stringify(event,null,2));
+          
+              if ("source" in event) {
+                  if (event.source !== "aws.events") throw new Error(`Unsupported event source ${event.source}.`);
+              }
+          
+          // Get instance state
+          var instanceId = process.env.INSTANCE_ID;
+              var rdsResponse = await rds.describeDBInstances({ DBInstanceIdentifier: instanceId }).promise();
+              var instance = rdsResponse.DBInstances[0];
+              console.log('RDS instance information: ', JSON.stringify(instance,null,2));
+              var state = instance.DBInstanceStatus;
+              
+              // Possible states shown at:
+              // https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.DBInstance.Status.html
+              
+              console.log(`RDS instance ${instanceId} current state = ${state}`);
+              
+              var responseAction;
+              var snsMessage;
+              
+          if (['stopped', 'stopping'].indexOf(state) >= 0) {
+                  console.log('Instance already stopped/stopping, nothing to do.');
+                  responseAction = 'nothingToDo';
+                  snsMessage = `RDS database ${instanceId} already stopped or stopping, nothing to do.`;
+              }
+              else if (['available']) {
+                  // The API call we make is different if the engine is Aurora:
+                  if (['aurora-postgresql', 'aurora-mysql', 'aurora'].indexOf(instance.Engine) >= 0) {
+                      console.log('Issuing stop cluster command...');
+                      await rds.stopDBCluster({ DBClusterIdentifier: instance.DBClusterIdentifier }).promise();
+                  }
+                  else {
+                      console.log('Issuing stop command...');
+                      await rds.stopDBInstance({ DBInstanceIdentifier: instanceId }).promise();
+                  }
+              responseAction = 'stoppingInstance'; 
+              snsMessage = `Stop command issues to RDS database ${instanceId}.`;
+          }
+          // if instance state anything else, return error (Step Functions will retry Lambda several times)
+              else {
+                  console.log('RDS instance cannot be stopped in its current state.');
+                  var e = new Error(`RDS instance cannot be stopped in its current state of ${state}.`);
+                  e.name = "CannotStopInCurrentState";
+                  throw e;
+              }
+          
+              const response = {
+                  statusCode: 200,
+                  action: responseAction,
+                  snsMessage: snsMessage
+              };
+              
+              return response;
+          };
